@@ -4,6 +4,7 @@ import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
 
 import 'face_detector.dart';
+import 'person_capture.dart';
 
 class CameraScreen extends StatefulWidget {
   final List<CameraDescription> cameras;
@@ -25,6 +26,9 @@ class _CameraScreenState extends State<CameraScreen> {
   bool _detectorReady = false;
   bool _liveDetect = false;
   bool _detecting = false; // a detection pass is currently in flight
+  // camera_windows allows only one takePicture() at a time; this lock serializes
+  // the live-detect loop against a manual capture so they never collide.
+  bool _captureInFlight = false;
   List<FaceDetection> _faces = const [];
   Size? _frameSize; // original captured-image dimensions
 
@@ -102,14 +106,19 @@ class _CameraScreenState extends State<CameraScreen> {
   Future<void> _detectLoop() async {
     if (!_liveDetect || _detecting) return;
     final controller = _controller;
-    if (controller == null || !_isInitialized || !_detectorReady) {
+    if (controller == null ||
+        !_isInitialized ||
+        !_detectorReady ||
+        _captureInFlight) {
       _scheduleNextTick();
       return;
     }
 
     _detecting = true;
+    _captureInFlight = true;
     try {
       final file = await controller.takePicture();
+      _captureInFlight = false;
       final bytes = await file.readAsBytes();
       final result = await _detector.detect(bytes);
       // Clean up the temporary frame file; it's only needed for inference.
@@ -126,6 +135,7 @@ class _CameraScreenState extends State<CameraScreen> {
       debugPrint('Detection error: $e');
     } finally {
       _detecting = false;
+      _captureInFlight = false; // safety net if takePicture threw
       _scheduleNextTick();
     }
   }
@@ -138,19 +148,54 @@ class _CameraScreenState extends State<CameraScreen> {
 
   Future<void> _takePicture() async {
     final controller = _controller;
-    if (controller == null || !_isInitialized || _isTakingPicture) return;
+    if (controller == null ||
+        !_isInitialized ||
+        _isTakingPicture ||
+        _captureInFlight) {
+      return;
+    }
 
     setState(() => _isTakingPicture = true);
+    _captureInFlight = true;
 
     try {
       final XFile file = await controller.takePicture();
+      _captureInFlight = false;
+      final bytes = await file.readAsBytes();
+
+      // Detect faces on the captured frame (if the model is ready), then save
+      // one upper-body crop per person. Falls back to the full frame when no
+      // face is found or the detector isn't loaded yet.
+      final faces = _detectorReady
+          ? (await _detector.detect(bytes)).faces
+          : const <FaceDetection>[];
+      final saved = await saveCrops(jpegBytes: bytes, faces: faces);
+
+      // The original full-resolution capture is a temp file; we've re-encoded
+      // what we need, so clean it up like the live-detect loop does.
+      try {
+        await File(file.path).delete();
+      } catch (_) {}
+
+      if (!mounted) return;
       setState(() {
-        _capturedImagePath = file.path;
+        if (saved.isNotEmpty) _capturedImagePath = saved.first;
         _isTakingPicture = false;
       });
+
+      final message = saved.isEmpty
+          ? 'Could not save picture'
+          : faces.isEmpty
+          ? 'No faces detected — saved full frame'
+          : 'Saved ${saved.length} '
+                '${saved.length == 1 ? 'picture' : 'pictures'} to captures/';
+      ScaffoldMessenger.of(context)
+        ..hideCurrentSnackBar()
+        ..showSnackBar(SnackBar(content: Text(message)));
     } on CameraException catch (e) {
       debugPrint('Capture error: ${e.code} — ${e.description}');
-      setState(() => _isTakingPicture = false);
+      _captureInFlight = false; // safety net if takePicture threw
+      if (mounted) setState(() => _isTakingPicture = false);
     }
   }
 
